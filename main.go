@@ -289,7 +289,8 @@ func fastLZEstimatorWithOffset(offset float64) func(tx []byte) float64 {
 func regressionEstimator(tx []byte) float64 {
 	flz := float64(flzCompressLen(tx))
 	l := float64(len(tx))
-	return -35.1823 + flz*1.0694 - l*0.1047
+	//return -35.1823 + flz*1.0694 - l*0.1047
+	return -38.1732 + flz*0.9630 - l*0.0641
 }
 
 func uncompressedSizeEstimator(tx []byte) float64 {
