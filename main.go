@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/ethereum/go-ethereum/cmd/utils"
 	"github.com/ethereum/go-ethereum/common"
@@ -21,26 +22,19 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/node"
-	"github.com/montanaflynn/stats"
-	"github.com/sajari/regression"
 )
 
 type estimator func([]byte) float64
 
 func main() {
-	blockNum := big.NewInt(9885000) // starting block; will iterate backwards from here
-	txsToFetch := 2000              // min # of transactions to include in our sample
-	minTxSize := 0                  // minimum transaction size to include in our sample whether to
+	blockNum := big.NewInt(-1) // starting block; will iterate backwards from here
+	txsToFetch := 1000000      // min # of transactions to include in our sample (negative means all txs)
+	minTxSize := 0             // minimum transaction size to include in our sample whether to
 
 	// spanBatchMode will remove signatures from the tx rlp before compression. This simulates the
 	// behavior of span batches which segregates the signatures from the more compressible parts of
 	// the tx during batch compression.
 	spanBatchMode := true
-
-	// whether to build a regression model instead of simple scalar-tuned estimator
-	useRegression := true
-	// when using regression, whether to also use the uncompressed tx size as a feature
-	uncompressedSizeFeature := true
 
 	// remote node URL or local database location:
 	// clientLocation := "https://mainnet.base.org"
@@ -51,13 +45,6 @@ func main() {
 
 	fmt.Printf("Starting block: %v, min tx sample size: %v, min tx size: %v, span batch mode: %v\n",
 		blockNum, txsToFetch, minTxSize, spanBatchMode)
-	if useRegression {
-		if uncompressedSizeFeature {
-			fmt.Println("Using regression with estimator + uncompress-tx-size as features")
-		} else {
-			fmt.Println("Using regression with simple estimator as the only feature")
-		}
-	}
 
 	var client Client
 	var err error
@@ -71,8 +58,11 @@ func main() {
 	}
 	defer client.Close()
 
-	zlibBestBatchEstimator := newZlibBatchEstimator().write
+	offsets := []float64{-15, -17.5, -20, -22.5, -25}
+
+	zlibBestBatchEstimator := newZlibBatchEstimator()
 	estimators := []estimator{
+		zlibBestBatchEstimator.write, // first estimator value is always used as the "ground truth" against which others are measured
 		uncompressedSizeEstimator,
 		cheap0Estimator,
 		cheap1Estimator,
@@ -90,169 +80,116 @@ func main() {
 		cheap2Estimator,
 		cheap3Estimator,
 		cheap4Estimator,
-		fastLZEstimator,
 		zlibBestEstimator,
-		zlibBestBatchEstimator, // final estimator value is always used as the "ground truth" against which others are measured
+		fastLZEstimator,
+		regressionEstimator,
 	}
-	columns := make([][]float64, len(estimators))
+	for _, offset := range offsets {
+		estimators = append(estimators, fastLZEstimatorWithOffset(offset))
+	}
+	totals := make([]float64, len(estimators))
+	scalars := make([]float64, len(estimators))
+	diffs := make([]float64, len(estimators))
+	diffsSq := make([]float64, len(estimators))
+	count := 0
 
-	bootstrapCount := 0
+	printInterval := 10 * time.Second
+	lastPrint := time.Now().Add(-printInterval)
 
-	var parentBlockHash *common.Hash
-	for {
-		var block *types.Block
-		if parentBlockHash == nil {
-			block, err = client.BlockByNumber(context.Background(), blockNum)
+	for i := 0; i < 2; i++ {
+		var nextBlockHash *common.Hash
+		count = 0
+		zlibBestBatchEstimator.reset()
+		if i == 0 {
+			fmt.Println("Calculating scalars...")
 		} else {
-			block, err = client.BlockByHash(context.Background(), *parentBlockHash)
+			fmt.Println("Calculating errors...")
 		}
-		if err != nil {
-			log.Fatal(err)
-		}
-		if block == nil {
-			log.Fatal("not enough blocks")
-		}
-		p := block.ParentHash()
-		parentBlockHash = &p
-		//fmt.Println("Blocknum:", blockNum, "Txs:", len(columns[0]))
-		for _, tx := range block.Transactions() {
-			if tx.Type() == types.DepositTxType {
-				continue
+
+		for {
+			var block *types.Block
+			if nextBlockHash == nil {
+				block, err = client.BlockByNumber(context.Background(), blockNum)
+			} else {
+				block, err = client.BlockByHash(context.Background(), *nextBlockHash)
 			}
-			b, err := tx.MarshalBinary()
 			if err != nil {
 				log.Fatal(err)
 			}
-			if len(b) < minTxSize {
-				continue
+			if block == nil {
+				break
 			}
-			if spanBatchMode {
-				// for span batch mode we trim the signature, and assume there is no estimation
-				// error on this component were we to just treat it as entirely uncompressible.
-				b = b[:len(b)-68.]
-			}
-			if bootstrapCount < bootstrapTxs {
-				zlibBestBatchEstimator(b)
-				bootstrapCount++
-				continue
-			}
-			for j := range estimators {
-				estimate := estimators[j](b)
-				columns[j] = append(columns[j], estimate)
-			}
-			if len(columns[0])%1000 == 0 {
-				fmt.Println(len(columns[0]), "out of", txsToFetch)
-			}
-		}
-		if len(columns[0]) > txsToFetch {
-			break
-		}
-	}
+			p := block.ParentHash()
+			nextBlockHash = &p
 
-	// compute normalizers to eliminate estimator bias reflecting what a chain operator does via
-	// scalar tuning
-	avgs := []float64{}
-	for j := range columns {
-		avg, err := stats.Mean(stats.Float64Data(columns[j]))
-		if err != nil {
-			log.Fatal(err)
-		}
-		avgs = append(avgs, avg)
-	}
-	fmt.Println()
-	prettyPrintStats("mean", estimators, avgs)
-
-	scalars := make([]float64, len(avgs))
-	if !useRegression {
-		for j := range columns {
-			scalars[j] = avgs[len(avgs)-1] / avgs[j]
-		}
-		fmt.Println()
-		prettyPrintStats("scalar", estimators, scalars)
-	}
-
-	// Create regressors for each estimator
-	reg := make([]regression.Regression, len(estimators))
-	if useRegression {
-		for j := range estimators {
-			reg[j].SetObserved("bytes after batch compression")
-			reg[j].SetVar(0, getFuncName(estimators[j]))
-			if uncompressedSizeFeature {
-				reg[j].SetVar(1, fmt.Sprintf("uncompressed bytes"))
+			if time.Since(lastPrint) > printInterval {
+				lastPrint = time.Now()
+				fmt.Println("Blocknum:", block.NumberU64())
 			}
-			for i := range columns[j] {
-				truth := columns[len(scalars)-1][i]
-				estimator := columns[j][i]
-				data := []float64{estimator}
-				if uncompressedSizeFeature {
-					data = append(data, columns[0][i]) // assumes the "uncompressed estimator" is always first
+
+			for _, tx := range block.Transactions() {
+				if tx.Type() == types.DepositTxType {
+					continue
 				}
-				reg[j].Train(regression.DataPoint(truth, data))
-			}
-			reg[j].Run()
-			fmt.Printf("Regression %v:\n%v\n", getFuncName(estimators[j]), reg[j].Formula)
-			fmt.Println("R^2:", reg[j].R2)
-			//fmt.Printf("Regression %d        :\n%s\n", j, reg[j])
-		}
-	}
-
-	// compute per-tx error values
-	absoluteErrors := make([][]float64, len(estimators))
-	squaredErrors := make([][]float64, len(estimators))
-
-	for j := range estimators {
-		ae := make([]float64, len(columns[j]))
-		se := make([]float64, len(columns[j]))
-		scalar := scalars[j]
-		for i := range columns[j] {
-			// output of the final estimator (which we assume to be the batched compression
-			// algorithm actually used by the batcher) is used as the "ground truth".
-			truth := columns[len(scalars)-1][i]
-			var estimate float64
-			if !useRegression {
-				// the estimate is the scaled output of the estimator
-				estimate = columns[j][i] * scalar
-			} else {
-				data := []float64{columns[j][i]}
-				if uncompressedSizeFeature {
-					data = append(data, columns[0][i]) // assumes the "uncompressed estimator" is always first
-				}
-				estimate, err = reg[j].Predict(data)
+				b, err := tx.MarshalBinary()
 				if err != nil {
-					panic(err)
+					log.Fatal(err)
 				}
+				if len(b) < minTxSize {
+					continue
+				}
+				if spanBatchMode {
+					// for span batch mode we trim the signature, and assume there is no estimation
+					// error on this component were we to just treat it as entirely incompressible.
+					b = b[:len(b)-68.]
+				}
+				count++
+				if count <= bootstrapTxs {
+					zlibBestBatchEstimator.write(b)
+					continue
+				}
+				var first float64
+				for j, e := range estimators {
+					estimate := e(b)
+					if i == 0 {
+						totals[j] += estimate
+					} else {
+						if j == 0 {
+							first = estimate
+						}
+						diff := estimate*scalars[j] - first
+						diffs[j] += math.Abs(diff)
+						diffsSq[j] += diff * diff
+					}
+				}
+				count++
 			}
-			e := estimate - truth
-			ae[i] = math.Abs(e)
-			se[i] = math.Pow(e, 2)
+			if txsToFetch > 0 && count > txsToFetch {
+				break
+			}
 		}
-		absoluteErrors[j] = ae
-		squaredErrors[j] = se
+
+		for j := range estimators {
+			scalars[j] = totals[0] / totals[j]
+		}
 	}
+
+	prettyPrintStats("scalars", estimators, scalars)
 
 	// compute mean error metrics
 	var mass []float64
 	for j := range estimators {
-		mas, err := stats.Mean(stats.Float64Data(absoluteErrors[j]))
-		if err != nil {
-			log.Fatal(err)
-		}
-		mass = append(mass, mas)
+		mass = append(mass, diffs[j]/float64(count))
 	}
 	fmt.Println()
 	prettyPrintStats("mean-absolute-error", estimators, mass)
 
 	var rmses []float64
 	for j := range estimators {
-		mse, err := stats.Mean(stats.Float64Data(squaredErrors[j]))
-		if err != nil {
-			log.Fatal(err)
-		}
-		rmses = append(rmses, math.Sqrt(mse))
+		rmses = append(rmses, math.Sqrt(diffsSq[j]/float64(count)))
 	}
 	fmt.Println()
 	prettyPrintStats("root-mean-sq-error", estimators, rmses)
-
 }
 
 func prettyPrintStats(prefix string, estimators []estimator, stats []float64) {
@@ -341,6 +278,18 @@ func zlibBestEstimator(tx []byte) float64 {
 
 func fastLZEstimator(tx []byte) float64 {
 	return float64(flzCompressLen(tx))
+}
+
+func fastLZEstimatorWithOffset(offset float64) func(tx []byte) float64 {
+	return func(tx []byte) float64 {
+		return float64(flzCompressLen(tx)) + offset
+	}
+}
+
+func regressionEstimator(tx []byte) float64 {
+	flz := float64(flzCompressLen(tx))
+	l := float64(len(tx))
+	return -35.1823 + flz*1.0694 - l*0.1047
 }
 
 func uncompressedSizeEstimator(tx []byte) float64 {
